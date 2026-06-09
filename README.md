@@ -1,128 +1,87 @@
-# [CVPR 2025] Learning Hazing to Dehazing: Towards Realistic Haze Generation for Real-World Image Dehazing [:link:](https://arxiv.org/abs/2503.19262)
+# PhysHazeDiffusion
 
-![Python 3.10](https://img.shields.io/badge/python-3.10-g) ![pytorch 2.2.2](https://img.shields.io/badge/pytorch-2.2.2-blue.svg)
+This is a physically constrained branch of the original HazeGen residual training code.
 
-This repository presents the implementation of the paper
+## Core Idea
 
->**Learning Hazing to Dehazing: Towards Realistic Haze Generation for Real-World Image Dehazing**<br> Ruiyi Wang, Yushuo Zheng, [Zicheng Zhang](https://zzc-1998.github.io), [Chunyi Li](https://lcysyzxdxc.github.io), [Shuaicheng Liu](http://www.liushuaicheng.org), [Guangtao Zhai](https://ee.sjtu.edu.cn/en/FacultyDetail.aspx?id=24&infoid=153&flag=153), [Xiaohong Liu](https://jhc.sjtu.edu.cn/~xiaohongliu/)<br>The IEEE / CVF Computer Vision and Pattern Recognition Conference (CVPR), 2025
+The diffusion model no longer generates a free RGB haze residual. It generates a
+single haze density/transmission field, represented as a 3-channel VAE carrier:
 
-We present a novel hazing-dehazing pipeline consisting of a Realistic Hazy Image Generation framework (HazeGen) and a Diffusion-based Dehazing framework (DiffDehaze).
+![PhysHazeDiffusion architecture](figures/phys_hazegen_architecture_cn_4k.png)
 
-![teaser](assets/teaser.jpg)
-![teaser](assets/result.jpg)
+```text
+diffusion(clean, depth, prompt) -> density d(x)
+airlight_head(clean) or real haze bank -> atmospheric light A
+I(x) = J(x) * (1 - d(x)) + A * d(x)
+```
 
-## 🛠️ Setup
+This keeps depth as a geometry cue and prevents it from directly changing RGB
+colors.
 
-### 📦 Repository
+## Stage 1
 
-Clone the repository (requires git):
+Stage 1 uses paired synthetic clean/hazy data:
+
+```text
+paired clean/hazy -> estimate A and density target
+VAE(density carrier) -> diffusion target z0
+airlight_head(clean) -> A
+```
+
+Run:
 
 ```bash
-git clone https://github.com/ruiyi-w/Learning-Hazing-to-Dehazing.git
-cd Learning-Hazing-to-Dehazing
+bash run_train_phys_hazegen.sh
 ```
 
-### 💻 Dependencies
-Using [Conda](https://conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html). After the installation, create the environment and install dependencies into it:
+Set `STAGE=stage1` in the script if you only want Stage 1.
+
+## Stage 2
+
+Stage 2 does real-domain adaptation without learning a free RGB pseudo target:
+
+```text
+teacher -> pseudo density
+real hazy images -> airlight bank
+CLIP prompt branch -> directional clean-to-haze constraint
+student learns density distribution + real haze parameter distribution
+```
+
+The CLIP branch is directional:
+
+```text
+CLIP(pred_hazy) - CLIP(clean)  aligned with  CLIP(haze_prompt) - CLIP(clear_prompt)
+```
+
+This asks whether the image change moves toward the haze domain, instead of
+forcing the generated image itself toward a hazy-image prototype.
+
+## Inference
+
+Run:
 
 ```bash
-conda create -n env_name python=3.10
-conda activate env_name
-pip install -r requirements.txt
+bash run_inference_phys_hazegen.sh
 ```
 
-Keep the environment activated before running the inference script. 
-Activate the environment again after restarting the terminal session.
+Atmospheric light can come from:
 
-## 🏃 Testing
-
-### 📷 Prepare input images
-
-Place your images in the `inputs/` directory. To set a different source directory, you can edit configuration files in `configs/inference/`.
-
-### ⬇ Download Checkpoints
-
-Download pre-trained models and place them to folder `weights/`, but you can always edit configuration files in `configs/inference/`.
-
-|        Model Name        |                         Description                          |                             Link                             |
-| :----------------------: | :----------------------------------------------------------: | :----------------------------------------------------------: |
-| v2-1_512-ema-pruned.ckpt | Pretrained Stable Diffusion v2.1 from stabilityai, providing generative priors | [download](https://huggingface.co/stabilityai/stable-diffusion-2-1-base) |
-|        stage1.pt         |               IRControlNet trained for HazeGen               | [download](https://pan.baidu.com/s/1vbxEwftJC9nUaMXJ-t9sww?pwd=8egg) |
-|        stage2.pt         |             IRControlNet trained for DiffDehaze              | [download](https://pan.baidu.com/s/1vbxEwftJC9nUaMXJ-t9sww?pwd=8egg) |
-
-### 🚀 Run inference
-
-To perform dehazing with standard spaced sampler, please run
-
-```bash
-python inference_stage2.py --config configs/inference/stage2.yaml
+```text
+AIRLIGHT_SOURCE=head   # predict A from clean image
+AIRLIGHT_SOURCE=bank   # sample A from real haze bank
+AIRLIGHT_SOURCE=fixed  # use FIXED_AIRLIGHT
 ```
 
-By default, results will be saved to `outputs/`. **Enjoy**!
+## Important Files
 
-To perform dehazing with AccSamp sampler, please run
+- `train_phys_hazegen.py`: two-stage physical training entry.
+- `inference_phys_hazegen.py`: physical composition inference.
+- `phys_haze_utils.py`: density/A estimation and composition utilities.
+- `configs/train/phys_stage.yaml`: 5-channel ControlNet config.
+- `run_train_phys_hazegen.sh`: default training command.
+- `run_inference_phys_hazegen.sh`: default inference command.
 
-```bash
-python inference_accsamp.py --config configs/inference/stage2_accsamp.yaml
-```
+## Notes
 
-To generate realisitic hazy images with HazeGen, please run
-
-```bash
-python inference_stage1.py --config configs/inference/stage1.yaml
-```
-
-To use a different hyperparameter settings, e.g., $\tau$ and $\omega$, please edit the corresponding `.yaml` configuration file.
-
-## 🏋️ Training
-
-1. Training data preparation. 
-   - The training of HazeGen requires real-world hazy data from the URHI split of [RESIDE](https://sites.google.com/view/reside-dehaze-datasets/reside-β) dataset and the synthetic hazy data from [RIDCP](https://github.com/RQ-Wu/RIDCP_dehazing). 
-   - To train DiffDehaze, you need to generate realistic hazy data from HazeGen based on clean images, e.g., the clean images from the OTS split of [RESIDE](https://sites.google.com/view/reside-dehaze-datasets/reside-β) dataset, using the inference script above.
-
-2. Accelerate configuration. The training is supported by the huggingface [Accelerate](https://huggingface.co/docs/transformers/accelerate) library. Before running training scripts, create and save a configuration file to help Accelerate correctly set up training based on your setup by running 
-
-```bash
-accelerate config
-```
-
-3. Fill in the training configuration files in `configs/train/` with appropriate values, especially for the paths to the training data. Please find specific instructions there.
-4. Start training! To train stage1 HazeGen model, run
-
-```bash
-accelerate launch train_stage1.py --config configs/train/stage1.yaml
-```
-
-5. To train stage2 DiffDehaze model, run
-
-```bash
-accelerate launch train_stage2.py --config configs/train/stage2.yaml
-```
-
-## ✏️ Acknowledgment
-
-A large part of the implementation is based on [DiffBIR](https://github.com/XPixelGroup/DiffBIR?tab=readme-ov-file#inference). We sincerely appreciate their wonderful work.
-
-## 🎓 Citation
-
-If you find our work useful, please consider cite our paper:
-
-```bibtex
-@misc{wang2025learninghazingdehazingrealistic,
-      title={Learning Hazing to Dehazing: Towards Realistic Haze Generation for Real-World Image Dehazing}, 
-      author={Ruiyi Wang and Yushuo Zheng and Zicheng Zhang and Chunyi Li and Shuaicheng Liu and Guangtao Zhai and Xiaohong Liu},
-      year={2025},
-      eprint={2503.19262},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2503.19262}, 
-}
-```
-
-## 🎫 License
-
-This work is licensed under the Apache License, Version 2.0 (as defined in the [LICENSE](LICENSE.txt)).
-
-By downloading and using the code and models you agree to the terms in the  [LICENSE](LICENSE.txt).
-
-[![License](https://img.shields.io/badge/License-Apache--2.0-929292)](https://www.apache.org/licenses/LICENSE-2.0)
+The `weights` directory is a symlink to the original project weights to avoid
+duplicating large checkpoint files.
