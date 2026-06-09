@@ -1,0 +1,438 @@
+\documentclass[11pt,a4paper]{ctexart}
+
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{caption}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  urlcolor=blue!55!black,
+  citecolor=blue!55!black
+}
+
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  backgroundcolor=\color{gray!5},
+  rulecolor=\color{gray!35}
+}
+\lstset{style=code}
+
+\title{\textbf{PhysHazeDiffusion 方法总结}\\
+\large 基于雾密度扩散与大气光物理渲染的真实雾图生成}
+\author{PhysHazeDiffusion Project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文档总结当前工程中的 PhysHazeDiffusion / PhysHazeGen 分支。该方法不让扩散模型直接生成自由 RGB 雾图或雾残差，而是让网络生成低维、可解释的雾密度场
+$d(\bm{x})$，同时由大气光头或真实雾域大气光库给出全局大气光 $\bm{A}$。最终通过物理成像模型
+\[
+  \bm{I}(\bm{x}) = \bm{J}(\bm{x})\bigl(1-d(\bm{x})\bigr) + \bm{A}d(\bm{x})
+\]
+将清晰图像 $\bm{J}$ 合成为雾图 $\bm{I}$。这种设计把几何结构、颜色控制和图像生成解耦，减少 RGB residual 方法中常见的偏色、纹理污染和不受控域迁移问题。
+\end{abstract}
+
+\section{符号约定}
+
+\begin{table}[h]
+\centering
+\caption{核心符号}
+\begin{tabular}{ll}
+\toprule
+符号 & 含义 \\
+\midrule
+$\bm{J}\in[0,1]^{3\times H\times W}$ & 清晰图像 clean image \\
+$\bm{I}\in[0,1]^{3\times H\times W}$ & 合成或真实雾图 hazy image \\
+$t(\bm{x})\in[0,1]$ & 透射率 transmission \\
+$d(\bm{x})\in[0,1]$ & 雾密度 haze density，满足 $d=1-t$ \\
+$\bm{A}\in[0,1]^3$ & 全局大气光 atmospheric light \\
+$\bm{C}\in[-1,1]^{3\times H\times W}$ & density carrier，给 VAE / diffusion 使用的三通道载体 \\
+$z_0$ & VAE 编码后的 density carrier latent \\
+$\mathcal{E}_{\rm VAE},\mathcal{D}_{\rm VAE}$ & VAE 编码器与解码器 \\
+$\epsilon_\theta$ 或 $f_\theta$ & 条件扩散 / ControlNet 去噪网络 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{物理成雾模型}
+
+\subsection{经典大气散射模型}
+
+单幅图像去雾与成雾通常使用大气散射模型：
+\begin{equation}
+  \bm{I}(\bm{x}) = \bm{J}(\bm{x})t(\bm{x}) + \bm{A}\bigl(1-t(\bm{x})\bigr),
+  \label{eq:atm}
+\end{equation}
+其中 $\bm{x}$ 表示像素位置，$\bm{J}$ 是无雾清晰图像，$\bm{I}$ 是观测雾图，$t$ 是透射率，$\bm{A}$ 是全局大气光。若场景深度为 $D(\bm{x})$，介质散射系数为 $\beta$，常见透射率形式为：
+\begin{equation}
+  t(\bm{x}) = \exp\bigl(-\beta D(\bm{x})\bigr).
+  \label{eq:transmission}
+\end{equation}
+深度越大或散射系数越强，$t$ 越小，远处物体越容易被大气光覆盖。
+
+\subsection{从 transmission 到 density}
+
+本工程将模型改写为雾密度形式：
+\begin{equation}
+  d(\bm{x}) = 1 - t(\bm{x}).
+  \label{eq:density_def}
+\end{equation}
+代入式 \eqref{eq:atm} 得到：
+\begin{align}
+  \bm{I}(\bm{x})
+    &= \bm{J}(\bm{x})\bigl(1-d(\bm{x})\bigr) + \bm{A}d(\bm{x}).
+  \label{eq:render}
+\end{align}
+因此，$d(\bm{x})$ 可以直接理解为当前像素从清晰图像颜色混合到大气光颜色的权重：
+\begin{itemize}[leftmargin=2em]
+  \item $d(\bm{x})=0$：完全保留清晰图像，$\bm{I}(\bm{x})=\bm{J}(\bm{x})$；
+  \item $d(\bm{x})=1$：完全由大气光决定，$\bm{I}(\bm{x})=\bm{A}$；
+  \item $0<d(\bm{x})<1$：清晰图像和大气光线性混合。
+\end{itemize}
+
+\subsection{与代码实现的对应关系}
+
+物理渲染器在 \texttt{phys\_haze\_utils.py} 中实现为：
+\begin{lstlisting}[language=Python]
+def compose_physical_haze(clean, density, airlight):
+    a = airlight.view(-1, 3, 1, 1).to(device=clean.device, dtype=clean.dtype)
+    density = density.clamp(0.0, 1.0)
+    return (clean * (1.0 - density) + a * density).clamp(0.0, 1.0)
+\end{lstlisting}
+这正是式 \eqref{eq:render} 的逐像素实现。
+
+\section{Density Carrier 表示}
+
+\subsection{为什么需要 carrier}
+
+Stable Diffusion 的 VAE 和 UNet 原本面向三通道 RGB 图像。雾密度 $d$ 是单通道标量场，若直接作为目标会与原始 VAE 输入格式不一致。因此工程中把单通道 density 扩展为三通道 carrier：
+\begin{equation}
+  \bm{C} = 2\cdot {\rm repeat}_3(d) - 1,
+  \label{eq:carrier}
+\end{equation}
+其中 $\bm{C}\in[-1,1]^{3\times H\times W}$。训练时使用 VAE 编码：
+\begin{equation}
+  z_0 = \mathcal{E}_{\rm VAE}(\bm{C}).
+  \label{eq:vae_encode}
+\end{equation}
+扩散模型学习的是 $z_0$ 的条件分布，而不是 RGB 雾图或 RGB residual。
+
+\subsection{从 carrier 解回 density}
+
+推理时扩散模型采样得到 latent $\hat{z}_0$，经 VAE 解码得到 carrier：
+\begin{equation}
+  \hat{\bm{C}} = \mathcal{D}_{\rm VAE}(\hat{z}_0).
+\end{equation}
+再把三通道 carrier 平均后映射回 $[0,1]$：
+\begin{equation}
+  \hat{d} =
+  {\rm clamp}\left(
+    \frac{1}{2}\left(\frac{1}{3}\sum_{c=1}^3 \hat{C}_c + 1\right),
+    0,1
+  \right).
+  \label{eq:carrier_to_density}
+\end{equation}
+代码对应：
+\begin{lstlisting}[language=Python]
+def density_to_carrier(density):
+    return density.expand(-1, 3, -1, -1) * 2.0 - 1.0
+
+def carrier_to_density(carrier_m11):
+    return ((carrier_m11.mean(dim=1, keepdim=True) + 1.0) * 0.5).clamp(0.0, 1.0)
+\end{lstlisting}
+
+\section{大气光 A 的建模}
+
+\subsection{AirlightHead}
+
+工程中使用一个轻量 CNN 从 clean image 预测低维大气光：
+\begin{equation}
+  \hat{\bm{A}} = 0.55 + 0.45\cdot \sigma(g_\phi(\bm{J})).
+  \label{eq:airlight_head}
+\end{equation}
+这里 $g_\phi$ 是 AirlightHead，输出三维 RGB 向量。该参数化把 $\bm{A}$ 限制在 $[0.55,1.0]$，避免大气光变成任意 RGB 颜色，使它保持“亮雾幕”的物理含义。
+
+\subsection{从真实雾图构建 A-bank}
+
+真实域适配阶段还会从真实雾图中估计大气光库。对雾图 $\bm{I}$，代码选择亮度最高的 top-$k$ 像素并求 RGB 均值：
+\begin{equation}
+  \bm{A}^{*}
+  =
+  \frac{1}{|\Omega_k|}
+  \sum_{\bm{x}\in\Omega_k}\bm{I}(\bm{x}),
+  \quad
+  \Omega_k = {\rm TopK}_{\bm{x}}\bigl({\rm mean}_c I_c(\bm{x})\bigr).
+\end{equation}
+之后在 Stage2 中从 bank 中随机采样 $\bm{A}$，使生成雾图的大气光分布靠近真实雾域。
+
+\section{网络框架}
+
+\subsection{整体设计}
+
+整体框架可以分为四个模块：
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{条件编码模块}：输入 clean image、可选 depth condition 和文本 prompt，构造 ControlNet 条件；
+  \item \textbf{Density Diffusion}：条件扩散模型生成 density carrier latent；
+  \item \textbf{Airlight 模块}：AirlightHead 预测 $\bm{A}$，或从真实雾域 A-bank 采样 $\bm{A}$；
+  \item \textbf{Physical Renderer}：使用式 \eqref{eq:render} 将 $\bm{J}$、$d$、$\bm{A}$ 合成为雾图。
+\end{enumerate}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{../../figures/phys_hazegen_architecture_cn_4k.png}
+\caption{PhysHazeDiffusion 网络框架示意图。扩散模型只负责 density，颜色由大气光和物理渲染器控制。}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{ControlNet 条件}
+
+配置文件 \texttt{configs/train/phys\_stage.yaml} 中，ControlNet 的 hint 通道数为 5：
+\begin{lstlisting}
+controlnet_cfg:
+  in_channels: 4
+  hint_channels: 5
+\end{lstlisting}
+其含义是：基础 latent 通道仍为 4，条件 hint 由 clean 图像相关条件和可选深度条件组成。深度只作为几何 cue 使用，帮助 density 形成合理的远近结构，而不直接改变 RGB 颜色。
+
+\section{Stage1：合成配对监督}
+
+\subsection{训练目标构造}
+
+Stage1 使用合成配对数据 $(\bm{J},\bm{I})$。首先从配对图像估计大气光 $\bm{A}^{*}$，再根据物理模型反解 density target。
+由式 \eqref{eq:render} 可得：
+\begin{equation}
+  \bm{I} - \bm{J}
+  =
+  d(\bm{A}-\bm{J}).
+\end{equation}
+逐通道近似反解：
+\begin{equation}
+  d_c^{*}(\bm{x})
+  =
+  \frac{I_c(\bm{x})-J_c(\bm{x})}
+       {A_c^{*}-J_c(\bm{x})+\varepsilon},
+  \label{eq:density_channel}
+\end{equation}
+然后对 RGB 通道求均值，并做低通平滑：
+\begin{equation}
+  d^{*}(\bm{x})
+  =
+  {\rm Blur}\left(
+  \frac{1}{3}\sum_{c=1}^{3}
+  {\rm clamp}\bigl(d_c^{*}(\bm{x}),0,1\bigr)
+  \right).
+  \label{eq:density_target}
+\end{equation}
+代码中分母下限为 0.08，并使用 Gaussian blur，使 density target 更偏向低频、保守的雾浓度分布。
+
+\subsection{Stage1 损失函数}
+
+将 $d^*$ 转为 carrier 并编码：
+\begin{equation}
+  z_0^* = \mathcal{E}_{\rm VAE}\left(2\cdot{\rm repeat}_3(d^*)-1\right).
+\end{equation}
+扩散训练使用标准 DDPM 损失。若模型采用噪声预测参数化，可写为：
+\begin{equation}
+  \mathcal{L}_{\rm diff}
+  =
+  \mathbb{E}_{t,\epsilon}
+  \left[
+    \left\|
+      \epsilon -
+      \epsilon_{\theta}(z_t,t,\mathbf{c})
+    \right\|_2^2
+  \right],
+  \quad
+  z_t=\sqrt{\bar{\alpha}_t}z_0^*+\sqrt{1-\bar{\alpha}_t}\epsilon.
+\end{equation}
+同时训练 AirlightHead：
+\begin{equation}
+  \mathcal{L}_{A}
+  =
+  {\rm SmoothL1}\left(\hat{\bm{A}},\bm{A}^{*}\right).
+\end{equation}
+Stage1 总损失为：
+\begin{equation}
+  \mathcal{L}_{\rm stage1}
+  =
+  \mathcal{L}_{\rm diff}
+  +
+  \lambda_A\mathcal{L}_{A}.
+  \label{eq:stage1_loss}
+\end{equation}
+
+\section{Stage2：真实雾域适配}
+
+\subsection{动机}
+
+Stage1 的 density 学自合成配对数据，雾结构较稳定，但合成数据的大气光分布、雾色和真实雾图仍可能有域差异。Stage2 的目标是在不引入自由 RGB pseudo target 的前提下，让模型向真实雾域靠近。
+
+\subsection{Teacher--Student pseudo density}
+
+Stage2 从 Stage1 checkpoint 初始化 teacher 和 student。Teacher 冻结，只采样 pseudo density latent：
+\begin{equation}
+  \tilde{z}_0 = {\rm Sample}_{\theta_T}(\bm{J},D,p),
+\end{equation}
+其中 $D$ 是可选深度条件，$p$ 是 haze prompt。Student 通过扩散损失学习 $\tilde{z}_0$：
+\begin{equation}
+  \mathcal{L}_{\rm pseudo}
+  =
+  \mathbb{E}_{t,\epsilon}
+  \left[
+    \left\|
+      \epsilon -
+      \epsilon_{\theta_S}(\tilde{z}_t,t,\mathbf{c})
+    \right\|_2^2
+  \right].
+\end{equation}
+注意 teacher 不提供 RGB 雾图，只提供 density latent，因此不会把 teacher 可能存在的 RGB 偏色直接传给 student。
+
+\subsection{CLIP 方向约束}
+
+传统 prototype loss 容易把生成图整体拉向“雾图中心”，造成曝光和颜色漂移。本方法使用方向约束：比较图像从 clean 到 pred-hazy 的 CLIP 变化方向，是否与文本从 clear 到 haze 的方向一致。
+
+文本方向：
+\begin{equation}
+  \Delta_{\rm text}
+  =
+  {\rm norm}\left(
+    F_{\rm text}(p_{\rm haze}) -
+    F_{\rm text}(p_{\rm clear})
+  \right).
+\end{equation}
+图像方向：
+\begin{equation}
+  \Delta_{\rm img}
+  =
+  {\rm norm}\left(
+    F_{\rm img}(\hat{\bm{I}}) -
+    F_{\rm img}(\bm{J})
+  \right).
+\end{equation}
+方向损失：
+\begin{equation}
+  \mathcal{L}_{\rm clip}
+  =
+  1 -
+  \left\langle
+    \Delta_{\rm img},
+    \Delta_{\rm text}
+  \right\rangle.
+  \label{eq:clip_loss}
+\end{equation}
+其中 $\hat{\bm{I}}$ 由物理 renderer 得到：
+\begin{equation}
+  \hat{\bm{I}}
+  =
+  \bm{J}(1-\hat{d})+\hat{\bm{A}}\hat{d}.
+\end{equation}
+
+\subsection{真实大气光分布约束}
+
+Stage2 构建真实雾图 A-bank，并采样 $\bm{A}_{\rm real}$。AirlightHead 的预测 $\hat{\bm{A}}$ 通过 SmoothL1 靠近真实雾域大气光分布：
+\begin{equation}
+  \mathcal{L}_{A,{\rm real}}
+  =
+  {\rm SmoothL1}\left(
+    \hat{\bm{A}},
+    \bm{A}_{\rm real}
+  \right).
+\end{equation}
+Stage2 总损失为：
+\begin{equation}
+  \mathcal{L}_{\rm stage2}
+  =
+  \mathcal{L}_{\rm pseudo}
+  +
+  \lambda_{\rm clip}\mathcal{L}_{\rm clip}
+  +
+  \lambda_{A,2}\mathcal{L}_{A,{\rm real}}.
+  \label{eq:stage2_loss}
+\end{equation}
+
+\section{推理流程}
+
+给定一张清晰图 $\bm{J}$，推理流程如下：
+\begin{enumerate}[leftmargin=2em]
+  \item 根据 clean image、prompt 和可选 depth 构造条件 $\mathbf{c}$；
+  \item 使用扩散采样器得到 density carrier latent $\hat{z}_0$；
+  \item VAE 解码 $\hat{z}_0$ 得到 carrier，并用式 \eqref{eq:carrier_to_density} 得到 $\hat{d}$；
+  \item 选择大气光来源：AirlightHead、真实 A-bank 或固定 $\bm{A}$；
+  \item 使用物理 renderer：
+  \[
+    \hat{\bm{I}} = \bm{J}(1-\hat{d})+\bm{A}\hat{d}.
+  \]
+\end{enumerate}
+核心代码对应 \texttt{inference\_phys\_hazegen.py}：
+\begin{lstlisting}[language=Python]
+z = sampler.sample(...)
+density = carrier_to_density(model.vae_decode(z))
+airlight = airlight_head(image)  # or bank / fixed
+result = compose_physical_haze(image, density, airlight)
+\end{lstlisting}
+
+\section{方法优势与局限}
+
+\subsection{优势}
+
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{物理可解释}：生成变量明确分为 density 和 atmospheric light，而不是难解释的 RGB residual。
+  \item \textbf{颜色更可控}：RGB 颜色主要由 $\bm{A}$ 和 clean image 决定，减少扩散模型自由生成颜色导致的偏色。
+  \item \textbf{结构更稳定}：depth 作为几何条件影响 density 分布，远近雾感更符合物理直觉。
+  \item \textbf{真实域迁移更温和}：Stage2 使用 A-bank 和 CLIP 方向约束，不把真实雾图 prototype 强行套到图像内容上。
+\end{itemize}
+
+\subsection{局限}
+
+\begin{itemize}[leftmargin=2em]
+  \item 全局 $\bm{A}$ 假设较简化，复杂光照或局部彩色雾场可能需要空间变化的 $\bm{A}(\bm{x})$。
+  \item density target 由 paired clean/hazy 反解得到，仍依赖大气光估计质量。
+  \item 线性物理 renderer 无法直接生成非均匀散射中的复杂光晕、雨雾颗粒等高频现象。
+  \item CLIP 方向约束是语义级约束，对细粒度物理真实感的约束有限。
+\end{itemize}
+
+\section{与工程文件的对应}
+
+\begin{table}[h]
+\centering
+\caption{实现文件索引}
+\begin{tabular}{ll}
+\toprule
+文件 & 作用 \\
+\midrule
+\texttt{phys\_haze\_utils.py} & density / A 估计、carrier 转换、物理成雾 renderer \\
+\texttt{train\_phys\_hazegen.py} & Stage1 与 Stage2 训练入口、损失函数和日志预览 \\
+\texttt{inference\_phys\_hazegen.py} & 推理采样与物理合成流程 \\
+\texttt{configs/train/phys\_stage.yaml} & ControlLDM、ControlNet、VAE、CLIP、diffusion 配置 \\
+\texttt{README\_PHYS\_HAZE.md} & 方法分支简要说明 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{总结}
+
+PhysHazeDiffusion 的核心思想可以概括为：
+\[
+  \boxed{
+    \text{Diffusion learns } d(\bm{x}),\quad
+    \text{Airlight controls } \bm{A},\quad
+    \text{Physics renders } \bm{I}.
+  }
+\]
+相比直接学习 RGB 雾图或 RGB residual，该方法把成雾过程拆成可解释的物理中间变量，使扩散模型专注于雾密度的空间结构，而把颜色、亮度和雾幕效果交给大气光与物理公式。这也是当前实验中效果较稳定的主要原因。
+
+\end{document}
